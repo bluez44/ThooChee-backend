@@ -1,0 +1,51 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TransactionType {
+  income
+  expense
+}
+
+model Transaction {
+  id        String          @id @default(uuid())
+  title     String
+  amount    Float
+  type      TransactionType
+  category  String
+  date      String
+  notes     String?
+  userId    String
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  @@map("transactions")
+}
+
+model Budget {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  monthlyLimit Float
+  currency     String   @default("VND")
+  updatedAt    DateTime @updatedAt
+
+  @@map("budgets")
+}
+
+model UserProfile {
+  id                   String   @id @default(uuid())
+  email                String   @unique
+  name                 String
+  notificationsEnabled Boolean  @default(true)
+  biometricsEnabled    Boolean  @default(false)
+  localSyncEnabled     Boolean  @default(true)
+  createdAt            DateTime @default(now())
+
+  @@map("user_profiles")
+}
