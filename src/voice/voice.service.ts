@@ -44,7 +44,7 @@ export class VoiceService {
 
     try {
       const response = await this.ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: this.buildPrompt(rawText, today),
         config: {
           responseMimeType: 'application/json',
