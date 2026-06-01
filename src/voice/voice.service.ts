@@ -1,4 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { GoogleGenAI, Type } from '@google/genai';
 import { VoiceParseRequestDto } from './dto/voice-parse-request.dto';
 import { CreateTransactionDto } from '../transactions/dto/create-transaction.dto';
 
@@ -7,111 +9,97 @@ export interface VoiceParseResponse {
   data: CreateTransactionDto | null;
   confidence: number;
   rawText: string;
-  suggestedCategories?: string[];
+  suggestedCategories: string[];
 }
 
-const EXPENSE_KEYWORDS = ['spent', 'spend', 'paid', 'pay', 'bought', 'buy', 'purchased', 'cost', 'expense'];
-const INCOME_KEYWORDS = ['earned', 'earn', 'received', 'receive', 'got paid', 'income', 'salary', 'wage', 'profit', 'deposit'];
-
-const CATEGORIES: Array<{ name: string; keywords: string[] }> = [
-  { name: 'Food', keywords: ['food', 'lunch', 'dinner', 'breakfast', 'eat', 'restaurant', 'meal', 'coffee', 'drink', 'snack', 'groceries', 'grocery', 'cafe'] },
-  { name: 'Transport', keywords: ['uber', 'grab', 'taxi', 'bus', 'transport', 'ride', 'gas', 'fuel', 'parking', 'train', 'metro', 'petrol'] },
-  { name: 'Shopping', keywords: ['clothes', 'shopping', 'shop', 'store', 'purchase', 'amazon', 'mall', 'market', 'shoes'] },
-  { name: 'Entertainment', keywords: ['movie', 'game', 'netflix', 'spotify', 'music', 'cinema', 'concert', 'entertainment'] },
-  { name: 'Health', keywords: ['medicine', 'doctor', 'pharmacy', 'hospital', 'medical', 'health', 'gym', 'clinic'] },
-  { name: 'Utilities', keywords: ['electricity', 'water', 'internet', 'bill', 'phone', 'rent', 'utilities'] },
-  { name: 'Salary', keywords: ['salary', 'wage', 'paycheck', 'payroll'] },
-];
+// Structured output schema — Gemini is constrained to return valid JSON matching this shape.
+const EXTRACTION_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    success:             { type: Type.BOOLEAN, description: 'True if a financial transaction was found.' },
+    title:               { type: Type.STRING,  description: 'Short human-readable label for the transaction.' },
+    amount:              { type: Type.NUMBER,  description: 'Transaction amount as a positive number.' },
+    type:                { type: Type.STRING,  enum: ['income', 'expense'] },
+    category:            { type: Type.STRING,  enum: ['Food', 'Transport', 'Shopping', 'Entertainment', 'Health', 'Utilities', 'Salary', 'Other'] },
+    date:                { type: Type.STRING,  description: 'Resolved date in YYYY-MM-DD format.' },
+    notes:               { type: Type.STRING,  nullable: true },
+    confidence:          { type: Type.NUMBER,  description: 'Parsing confidence between 0.0 and 1.0.' },
+    suggestedCategories: { type: Type.ARRAY, items: { type: Type.STRING } },
+  },
+  required: ['success', 'title', 'amount', 'type', 'category', 'date', 'confidence', 'suggestedCategories'],
+};
 
 @Injectable()
 export class VoiceService {
-  parse(dto: VoiceParseRequestDto): VoiceParseResponse {
-    const rawText = dto.text.trim();
-    const lower = rawText.toLowerCase();
+  private readonly logger = new Logger(VoiceService.name);
+  private readonly ai: GoogleGenAI;
 
-    const amount = this.extractAmount(lower);
-    if (amount === null) {
+  constructor(config: ConfigService) {
+    this.ai = new GoogleGenAI({ apiKey: config.getOrThrow<string>('GEMINI_API_KEY') });
+  }
+
+  async parse(dto: VoiceParseRequestDto): Promise<VoiceParseResponse> {
+    const rawText = dto.text.trim();
+    const today = this.resolveLocalDate(dto.timezoneOffset);
+
+    try {
+      const response = await this.ai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents: this.buildPrompt(rawText, today),
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: EXTRACTION_SCHEMA,
+        },
+      });
+
+      const extracted = JSON.parse(response.text ?? '');
+
+      if (!extracted.success || !extracted.amount) {
+        return { success: false, data: null, confidence: 0, rawText, suggestedCategories: [] };
+      }
+
+      return {
+        success: true,
+        data: {
+          title:    extracted.title,
+          amount:   extracted.amount,
+          type:     extracted.type,
+          category: extracted.category,
+          date:     extracted.date || today,
+          notes:    extracted.notes ?? rawText,
+        },
+        confidence:          Math.min(Math.max(extracted.confidence, 0), 1),
+        rawText,
+        suggestedCategories: extracted.suggestedCategories ?? [],
+      };
+    } catch (error) {
+      this.logger.error('Gemini voice parse failed', error?.message);
       return { success: false, data: null, confidence: 0, rawText, suggestedCategories: [] };
     }
-
-    const type = this.detectType(lower);
-    const { category, suggestedCategories } = this.detectCategory(lower);
-    const title = this.extractTitle(rawText, category);
-    const date = this.parseDate(lower, dto.timezoneOffset);
-
-    // Confidence: 0.4 base (found amount) + 0.2 each for type signal, category match, title extraction
-    let confidence = 0.4;
-    if (EXPENSE_KEYWORDS.some((k) => lower.includes(k)) || INCOME_KEYWORDS.some((k) => lower.includes(k))) confidence += 0.2;
-    if (category !== 'Other') confidence += 0.2;
-    if (title !== category) confidence += 0.2;
-
-    return {
-      success: true,
-      data: { title, amount, type, category, date, notes: rawText },
-      confidence: Math.round(confidence * 100) / 100,
-      rawText,
-      suggestedCategories,
-    };
   }
 
-  private extractAmount(lower: string): number | null {
-    // Handles: $50, 50k, 50 dollars, 50000 vnd, 50.5, 1,000
-    const match = lower.match(/(?:[$₫đ]\s*)?(\d[\d,]*(?:\.\d+)?)(\s*k)?\s*(?:dollars?|usd|vnd|dong|bucks?|đ\b)?/);
-    if (!match) return null;
-
-    let amount = parseFloat(match[1].replace(/,/g, ''));
-    if (match[2]) amount *= 1000; // "k" suffix
-    return isNaN(amount) ? null : amount;
+  private buildPrompt(text: string, today: string): string {
+    return [
+      `You are a financial transaction parser for a personal expense tracking app.`,
+      `Today's date is ${today}.`,
+      ``,
+      `Extract a transaction from the following voice or text input:`,
+      `"${text}"`,
+      ``,
+      `Rules:`,
+      `- Set success=true only when the input clearly describes a financial transaction with an identifiable amount.`,
+      `- Interpret relative dates ("today", "yesterday", "last week") using today's date (${today}).`,
+      `- confidence: 0.0–1.0 reflecting how unambiguously the transaction is described.`,
+      `- suggestedCategories: all plausible categories (at minimum ["Other"]).`,
+      `- If success=false, still fill every field with sensible defaults (amount=0, type="expense", etc.).`,
+    ].join('\n');
   }
 
-  private detectType(lower: string): 'income' | 'expense' {
-    const isIncome = INCOME_KEYWORDS.some((k) => lower.includes(k));
-    const isExpense = EXPENSE_KEYWORDS.some((k) => lower.includes(k));
-    // Income only if explicitly mentioned and no expense keyword overrides
-    return isIncome && !isExpense ? 'income' : 'expense';
-  }
-
-  private detectCategory(lower: string): { category: string; suggestedCategories: string[] } {
-    const matched: string[] = [];
-    for (const { name, keywords } of CATEGORIES) {
-      if (keywords.some((k) => lower.includes(k))) matched.push(name);
-    }
-    return {
-      category: matched[0] ?? 'Other',
-      suggestedCategories: matched.length ? matched : ['Other'],
-    };
-  }
-
-  private extractTitle(original: string, fallback: string): string {
-    // "on <thing>" or "for <thing>" — capture until a date/number boundary
-    const onMatch = original.match(/\b(?:on|for)\s+([a-zA-Z][a-zA-Z\s]{1,30}?)(?:\s+(?:yesterday|today|last|\d)|$)/i);
-    if (onMatch) return this.capitalize(onMatch[1].trim());
-    return fallback;
-  }
-
-  private parseDate(lower: string, timezoneOffset?: number): string {
-    // timezoneOffset from Date.getTimezoneOffset(): UTC - local in minutes
+  // timezoneOffset from Date.getTimezoneOffset(): UTC − local in minutes.
+  private resolveLocalDate(timezoneOffset?: number): string {
     const now = timezoneOffset !== undefined
       ? new Date(Date.now() - timezoneOffset * 60000)
       : new Date();
-
-    if (lower.includes('yesterday')) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - 1);
-      return d.toISOString().split('T')[0];
-    }
-    if (lower.includes('last week')) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - 7);
-      return d.toISOString().split('T')[0];
-    }
-    const isoMatch = lower.match(/(\d{4}-\d{2}-\d{2})/);
-    if (isoMatch) return isoMatch[1];
-
     return now.toISOString().split('T')[0];
-  }
-
-  private capitalize(s: string): string {
-    return s.charAt(0).toUpperCase() + s.slice(1);
   }
 }

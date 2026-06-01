@@ -1,166 +1,203 @@
 import { Test } from '@nestjs/testing';
+import { ConfigService } from '@nestjs/config';
 import { VoiceService } from './voice.service';
 
+// ── Mock @google/genai ────────────────────────────────────────────────────────
+const mockGenerateContent = jest.fn();
+
+jest.mock('@google/genai', () => ({
+  GoogleGenAI: jest.fn().mockImplementation(() => ({
+    models: { generateContent: mockGenerateContent },
+  })),
+  Type: {
+    OBJECT: 'OBJECT', STRING: 'STRING', NUMBER: 'NUMBER',
+    BOOLEAN: 'BOOLEAN', ARRAY: 'ARRAY',
+  },
+}));
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const geminiOk = (overrides: object = {}) =>
+  mockGenerateContent.mockResolvedValueOnce({
+    text: JSON.stringify({
+      success: true,
+      title: 'Lunch',
+      amount: 50000,
+      type: 'expense',
+      category: 'Food',
+      date: '2026-06-01',
+      notes: null,
+      confidence: 0.95,
+      suggestedCategories: ['Food'],
+      ...overrides,
+    }),
+  });
+
+const geminiNoMatch = () =>
+  mockGenerateContent.mockResolvedValueOnce({
+    text: JSON.stringify({
+      success: false,
+      title: '', amount: 0, type: 'expense', category: 'Other',
+      date: '2026-06-01', notes: null, confidence: 0, suggestedCategories: [],
+    }),
+  });
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 describe('VoiceService', () => {
   let service: VoiceService;
 
   beforeEach(async () => {
+    mockGenerateContent.mockReset();
+
     const module = await Test.createTestingModule({
-      providers: [VoiceService],
+      providers: [
+        VoiceService,
+        { provide: ConfigService, useValue: { getOrThrow: jest.fn().mockReturnValue('fake-key') } },
+      ],
     }).compile();
+
     service = module.get(VoiceService);
   });
 
-  describe('parse – amount extraction', () => {
-    it('returns failure when the input contains no number', () => {
-      const result = service.parse({ text: 'I had a great day' });
-      expect(result.success).toBe(false);
-      expect(result.data).toBeNull();
-      expect(result.confidence).toBe(0);
-      expect(result.rawText).toBe('I had a great day');
-    });
+  // ─── Success path ───────────────────────────────────────────────────────────
 
-    it('extracts a plain integer amount', () => {
-      const result = service.parse({ text: 'spent 50000' });
+  describe('parse – success path', () => {
+    it('returns success=true with all fields mapped from Gemini response', async () => {
+      geminiOk();
+      const result = await service.parse({ text: 'I spent 50000 on lunch' });
+
       expect(result.success).toBe(true);
-      expect(result.data!.amount).toBe(50000);
+      expect(result.data).toMatchObject({
+        title: 'Lunch', amount: 50000, type: 'expense',
+        category: 'Food', date: '2026-06-01',
+      });
+      expect(result.confidence).toBe(0.95);
+      expect(result.suggestedCategories).toContain('Food');
     });
 
-    it('expands a k-suffix to thousands', () => {
-      const result = service.parse({ text: 'spent 50k' });
-      expect(result.data!.amount).toBe(50000);
-    });
-
-    it('handles decimal amounts', () => {
-      const result = service.parse({ text: 'paid 9.99 dollars' });
-      expect(result.data!.amount).toBe(9.99);
-    });
-
-    it('trims surrounding whitespace from the input', () => {
-      const result = service.parse({ text: '  spent 50000  ' });
+    it('trims surrounding whitespace before sending to Gemini', async () => {
+      geminiOk();
+      const result = await service.parse({ text: '  spent 50000  ' });
       expect(result.rawText).toBe('spent 50000');
     });
 
-    it('stores rawText as the notes field on the parsed data', () => {
-      const result = service.parse({ text: 'spent 50000 on lunch' });
-      expect(result.data!.notes).toBe(result.rawText);
-    });
-  });
-
-  describe('parse – type detection', () => {
-    it('defaults to expense when no type keyword is present', () => {
-      const result = service.parse({ text: '50000 on food' });
-      expect(result.data!.type).toBe('expense');
+    it('uses rawText as notes when Gemini returns null for notes', async () => {
+      geminiOk({ notes: null });
+      const result = await service.parse({ text: 'I spent 50000 on lunch' });
+      expect(result.data!.notes).toBe('I spent 50000 on lunch');
     });
 
-    it('detects income from an income keyword', () => {
-      const result = service.parse({ text: 'received salary 5000000' });
-      expect(result.data!.type).toBe('income');
-    });
-
-    it('prefers expense when both income and expense keywords are present', () => {
-      const result = service.parse({ text: 'I earned but spent 50000' });
-      expect(result.data!.type).toBe('expense');
-    });
-  });
-
-  describe('parse – category detection', () => {
-    it('detects Food category from "lunch"', () => {
-      const result = service.parse({ text: 'spent 50000 on lunch' });
-      expect(result.data!.category).toBe('Food');
-    });
-
-    it('detects Transport category from "taxi"', () => {
-      const result = service.parse({ text: 'paid 50000 for taxi' });
-      expect(result.data!.category).toBe('Transport');
-    });
-
-    it('detects Health category from "gym"', () => {
-      const result = service.parse({ text: 'paid 200000 for gym' });
-      expect(result.data!.category).toBe('Health');
-    });
-
-    it('falls back to Other and returns ["Other"] when no keyword matches', () => {
-      const result = service.parse({ text: 'spent 50000' });
-      expect(result.data!.category).toBe('Other');
-      expect(result.suggestedCategories).toEqual(['Other']);
-    });
-
-    it('lists all matched categories in suggestedCategories', () => {
-      // "food" → Food, "gym" → Health
-      const result = service.parse({ text: 'paid 100000 for food and gym' });
-      expect(result.suggestedCategories).toContain('Food');
-      expect(result.suggestedCategories).toContain('Health');
-    });
-  });
-
-  describe('parse – title extraction', () => {
-    it('extracts a title from the "on <thing>" pattern', () => {
-      const result = service.parse({ text: 'I spent 50000 on lunch yesterday' });
-      expect(result.data!.title).toBe('Lunch');
-    });
-
-    it('extracts a title from the "for <thing>" pattern', () => {
-      const result = service.parse({ text: 'paid 50000 for taxi' });
-      expect(result.data!.title).toBe('Taxi');
-    });
-
-    it('falls back to the category name when no title pattern matches', () => {
-      const result = service.parse({ text: 'spent 50000' });
-      expect(result.data!.title).toBe(result.data!.category);
-    });
-  });
-
-  describe('parse – date parsing', () => {
-    beforeEach(() => {
+    it('falls back to today when Gemini returns an empty date', async () => {
       jest.useFakeTimers();
       jest.setSystemTime(new Date('2026-06-01T12:00:00Z'));
-    });
 
-    afterEach(() => jest.useRealTimers());
-
-    it('uses today when no date keyword is present (UTC offset 0)', () => {
-      const result = service.parse({ text: 'spent 50000', timezoneOffset: 0 });
+      geminiOk({ date: '' });
+      const result = await service.parse({ text: 'spent 50000', timezoneOffset: 0 });
       expect(result.data!.date).toBe('2026-06-01');
+
+      jest.useRealTimers();
     });
 
-    it('returns yesterday for the "yesterday" keyword', () => {
-      const result = service.parse({ text: 'spent 50000 yesterday', timezoneOffset: 0 });
-      expect(result.data!.date).toBe('2026-05-31');
+    it('clamps confidence above 1.0 down to 1', async () => {
+      geminiOk({ confidence: 1.5 });
+      const result = await service.parse({ text: 'spent 50000 on lunch' });
+      expect(result.confidence).toBe(1);
     });
 
-    it('returns 7 days ago for the "last week" keyword', () => {
-      const result = service.parse({ text: 'spent 50000 last week', timezoneOffset: 0 });
-      expect(result.data!.date).toBe('2026-05-25');
+    it('clamps confidence below 0.0 up to 0', async () => {
+      geminiOk({ confidence: -0.2 });
+      const result = await service.parse({ text: 'spent 50000 on lunch' });
+      expect(result.confidence).toBe(0);
     });
 
-    it('uses an explicit ISO date when one is present in the text', () => {
-      const result = service.parse({ text: 'spent 50000 on 2025-12-25' });
-      expect(result.data!.date).toBe('2025-12-25');
+    it('maps income type correctly', async () => {
+      geminiOk({ type: 'income', category: 'Salary', title: 'Salary', amount: 5_000_000 });
+      const result = await service.parse({ text: 'received salary 5000000' });
+      expect(result.data!.type).toBe('income');
+      expect(result.data!.category).toBe('Salary');
     });
   });
 
-  describe('parse – confidence score', () => {
-    it('is 0 when parsing fails', () => {
-      expect(service.parse({ text: 'no numbers here' }).confidence).toBe(0);
+  // ─── Failure path ───────────────────────────────────────────────────────────
+
+  describe('parse – failure path', () => {
+    it('returns success=false when Gemini cannot extract a transaction', async () => {
+      geminiNoMatch();
+      const result = await service.parse({ text: 'I had a great day' });
+
+      expect(result.success).toBe(false);
+      expect(result.data).toBeNull();
+      expect(result.confidence).toBe(0);
+      expect(result.suggestedCategories).toEqual([]);
     });
 
-    it('is 0.4 for amount alone with no other signals', () => {
-      // plain number, no type keyword, no category, no title pattern
-      expect(service.parse({ text: '50000' }).confidence).toBe(0.4);
+    it('returns success=false when Gemini marks success=true but amount is 0', async () => {
+      geminiOk({ amount: 0 });
+      const result = await service.parse({ text: 'no real amount here' });
+      expect(result.success).toBe(false);
+      expect(result.data).toBeNull();
     });
 
-    it('increases with each additional signal', () => {
-      const amount   = service.parse({ text: '50000' });
-      const keyword  = service.parse({ text: 'spent 50000' });
-      const category = service.parse({ text: 'spent 50000 on lunch' });
-      expect(keyword.confidence).toBeGreaterThan(amount.confidence);
-      expect(category.confidence).toBeGreaterThan(keyword.confidence);
+    it('returns success=false and does not throw when the Gemini API call fails', async () => {
+      mockGenerateContent.mockRejectedValueOnce(new Error('Network error'));
+      const result = await service.parse({ text: 'spent 50000 on lunch' });
+
+      expect(result.success).toBe(false);
+      expect(result.data).toBeNull();
     });
 
-    it('never exceeds 1.0', () => {
-      const result = service.parse({ text: 'I spent 50000 on lunch yesterday' });
-      expect(result.confidence).toBeLessThanOrEqual(1.0);
+    it('returns success=false when the API returns malformed JSON', async () => {
+      mockGenerateContent.mockResolvedValueOnce({ text: 'not-valid-json' });
+      const result = await service.parse({ text: 'spent 50000 on lunch' });
+
+      expect(result.success).toBe(false);
+    });
+  });
+
+  // ─── Prompt content ─────────────────────────────────────────────────────────
+
+  describe('parse – prompt', () => {
+    it('includes the raw user text in the prompt', async () => {
+      geminiOk();
+      await service.parse({ text: 'spent 50000 on lunch' });
+
+      const call = mockGenerateContent.mock.calls[0][0];
+      expect(call.contents).toContain('spent 50000 on lunch');
+    });
+
+    it('includes today\'s date in the prompt', async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2026-06-01T12:00:00Z'));
+
+      geminiOk();
+      await service.parse({ text: 'spent 50000', timezoneOffset: 0 });
+
+      const call = mockGenerateContent.mock.calls[0][0];
+      expect(call.contents).toContain('2026-06-01');
+
+      jest.useRealTimers();
+    });
+
+    it('resolves the correct local date from timezoneOffset', async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date('2026-06-01T20:00:00Z')); // UTC 20:00
+
+      geminiOk({ date: '2026-06-02' });
+      // UTC+7 (offset = -420): local time = 2026-06-02T03:00 → date is 2026-06-02
+      await service.parse({ text: 'spent 50000', timezoneOffset: -420 });
+
+      const call = mockGenerateContent.mock.calls[0][0];
+      expect(call.contents).toContain('2026-06-02');
+
+      jest.useRealTimers();
+    });
+
+    it('passes the structured output config to Gemini', async () => {
+      geminiOk();
+      await service.parse({ text: 'spent 50000' });
+
+      const call = mockGenerateContent.mock.calls[0][0];
+      expect(call.config?.responseMimeType).toBe('application/json');
+      expect(call.config?.responseSchema).toBeDefined();
     });
   });
 });
