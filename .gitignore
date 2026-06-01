@@ -22,6 +22,12 @@ lerna-debug.log*
 # Claude Code
 .claude/
 
+# Prisma generated client (regenerated via `prisma generate`)
+src/generated/
+
+# Environment variables
+.env
+
 # IDEs and editors
 /.idea
 .project
