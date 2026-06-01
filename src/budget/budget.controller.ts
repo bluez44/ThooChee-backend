@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Body } from '@nestjs/common';
+import { Controller, Get, Put, Delete, Body } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { BudgetService } from './budget.service';
 import { UpdateBudgetDto } from './dto/update-budget.dto';
@@ -20,5 +20,12 @@ export class BudgetController {
   @ApiResponse({ status: 200, description: 'Updated budget settings.' })
   update(@Body() dto: UpdateBudgetDto) {
     return this.budgetService.update(dto);
+  }
+
+  @Delete()
+  @ApiOperation({ summary: 'Reset budget to defaults', description: 'Deletes the current budget record and re-initialises with default values (5,000,000 VND).' })
+  @ApiResponse({ status: 200, description: 'Budget reset to defaults.' })
+  reset() {
+    return this.budgetService.reset();
   }
 }

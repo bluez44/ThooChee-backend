@@ -56,13 +56,17 @@ export class TransactionsService {
   }
 
   async update(id: string, dto: UpdateTransactionDto) {
-    await this.findOne(id);
-    return this.prisma.transaction.update({ where: { id }, data: dto });
+    return this.prisma.transaction.update({ where: { id }, data: dto }).catch((e) => {
+      if (e?.code === 'P2025') throw new NotFoundException(`Transaction ${id} not found`);
+      throw e;
+    });
   }
 
   async remove(id: string): Promise<{ success: boolean }> {
-    await this.findOne(id);
-    await this.prisma.transaction.delete({ where: { id } });
+    await this.prisma.transaction.delete({ where: { id } }).catch((e) => {
+      if (e?.code === 'P2025') throw new NotFoundException(`Transaction ${id} not found`);
+      throw e;
+    });
     return { success: true };
   }
 }

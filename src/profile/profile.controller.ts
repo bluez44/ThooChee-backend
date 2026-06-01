@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Body } from '@nestjs/common';
+import { Controller, Get, Put, Delete, Body } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { ProfileService } from './profile.service';
 import { UpdateUserProfileDto } from './dto/update-user-profile.dto';
@@ -20,5 +20,12 @@ export class ProfileController {
   @ApiResponse({ status: 200, description: 'Updated user profile.' })
   update(@Body() dto: UpdateUserProfileDto) {
     return this.profileService.update(dto);
+  }
+
+  @Delete()
+  @ApiOperation({ summary: 'Reset profile to defaults', description: 'Deletes the current profile and re-initialises with default values.' })
+  @ApiResponse({ status: 200, description: 'Profile reset to defaults.' })
+  reset() {
+    return this.profileService.reset();
   }
 }
