@@ -16,8 +16,8 @@ async function bootstrap() {
     .setVersion('1.0')
     .build();
 
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('docs', app, document, {
+  const documentFactory = () => SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('docs', app, documentFactory, {
     customCssUrl: '/swagger-ui/swagger-ui.css',
     customJs: [
       '/swagger-ui/swagger-ui-bundle.js',
