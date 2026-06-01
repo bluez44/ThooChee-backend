@@ -1,92 +1,68 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { Prisma } from '../generated/prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
 import { CreateTransactionDto } from './dto/create-transaction.dto';
 import { UpdateTransactionDto } from './dto/update-transaction.dto';
 import { QueryTransactionsDto } from './dto/query-transactions.dto';
 
-export interface Transaction {
-  id: string;
-  title: string;
-  amount: number;
-  type: 'income' | 'expense';
-  category: string;
-  date: string;
-  notes: string | null;
-  userId: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface TransactionListResponse {
-  transactions: Transaction[];
-  totalCount: number;
-  page: number;
-  pageSize: number;
-  totalPages: number;
-}
-
 @Injectable()
 export class TransactionsService {
-  private readonly store = new Map<string, Transaction>();
+  constructor(private readonly prisma: PrismaService) {}
 
-  findAll(query: QueryTransactionsDto): TransactionListResponse {
+  async findAll(query: QueryTransactionsDto) {
     const page = Math.max(Number(query.page) || 1, 1);
     const pageSize = Math.min(Number(query.pageSize) || 20, 100);
 
-    let results = Array.from(this.store.values());
-
-    if (query.search) {
-      const term = query.search.toLowerCase();
-      results = results.filter((t) => t.title.toLowerCase().includes(term));
+    const where: Prisma.TransactionWhereInput = {};
+    if (query.search) where.title = { contains: query.search, mode: 'insensitive' };
+    if (query.type) where.type = query.type;
+    if (query.category) where.category = query.category;
+    if (query.startDate || query.endDate) {
+      where.date = {
+        ...(query.startDate && { gte: query.startDate }),
+        ...(query.endDate && { lte: query.endDate }),
+      };
     }
-    if (query.type) results = results.filter((t) => t.type === query.type);
-    if (query.category) results = results.filter((t) => t.category === query.category);
-    if (query.startDate) results = results.filter((t) => t.date >= query.startDate!);
-    if (query.endDate) results = results.filter((t) => t.date <= query.endDate!);
 
-    results.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const [transactions, totalCount] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+      }),
+      this.prisma.transaction.count({ where }),
+    ]);
 
-    const totalCount = results.length;
-    const totalPages = Math.max(Math.ceil(totalCount / pageSize), 1);
-    const transactions = results.slice((page - 1) * pageSize, page * pageSize);
-
-    return { transactions, totalCount, page, pageSize, totalPages };
+    return {
+      transactions,
+      totalCount,
+      page,
+      pageSize,
+      totalPages: Math.max(Math.ceil(totalCount / pageSize), 1),
+    };
   }
 
-  findOne(id: string): Transaction {
-    const transaction = this.store.get(id);
+  async findOne(id: string) {
+    const transaction = await this.prisma.transaction.findUnique({ where: { id } });
     if (!transaction) throw new NotFoundException(`Transaction ${id} not found`);
     return transaction;
   }
 
-  create(dto: CreateTransactionDto): Transaction {
-    const now = new Date().toISOString();
-    const transaction: Transaction = {
-      id: crypto.randomUUID(),
-      ...dto,
-      notes: dto.notes ?? null,
-      userId: 'default-user',
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.store.set(transaction.id, transaction);
-    return transaction;
+  async create(dto: CreateTransactionDto) {
+    return this.prisma.transaction.create({
+      data: { ...dto, notes: dto.notes ?? null, userId: 'default-user' },
+    });
   }
 
-  update(id: string, dto: UpdateTransactionDto): Transaction {
-    const existing = this.findOne(id);
-    const updated: Transaction = {
-      ...existing,
-      ...dto,
-      notes: 'notes' in dto ? (dto.notes ?? null) : existing.notes,
-      updatedAt: new Date().toISOString(),
-    };
-    this.store.set(id, updated);
-    return updated;
+  async update(id: string, dto: UpdateTransactionDto) {
+    await this.findOne(id);
+    return this.prisma.transaction.update({ where: { id }, data: dto });
   }
 
-  remove(id: string): { success: boolean } {
-    this.findOne(id);
-    this.store.delete(id);
+  async remove(id: string): Promise<{ success: boolean }> {
+    await this.findOne(id);
+    await this.prisma.transaction.delete({ where: { id } });
     return { success: true };
   }
 }
